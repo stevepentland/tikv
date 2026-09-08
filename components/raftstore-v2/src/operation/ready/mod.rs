@@ -637,32 +637,33 @@ impl<EK: KvEngine, ER: RaftEngine> Peer<EK, ER> {
         msg: RaftMessage,
     ) {
         let message = msg.get_message();
-        if message.get_msg_type() == MessageType::MsgAppend
-            && let Some(fe) = message.get_entries().first()
-            && let Some(le) = message.get_entries().last()
-        {
-            let last = (le.get_term(), le.get_index());
-            let first = (fe.get_term(), fe.get_index());
-            let now = Instant::now();
-            let queue = self.proposals_mut().queue_mut();
-            // Proposals are batched up, so it will liely hit after one or two steps.
-            for p in queue.iter_mut().rev() {
-                if p.sent {
-                    break;
+        if message.get_msg_type() == MessageType::MsgAppend {
+            if let (Some(fe), Some(le)) =
+                (message.get_entries().first(), message.get_entries().last())
+            {
+                let last = (le.get_term(), le.get_index());
+                let first = (fe.get_term(), fe.get_index());
+                let now = Instant::now();
+                let queue = self.proposals_mut().queue_mut();
+                // Proposals are batched up, so it will liely hit after one or two steps.
+                for p in queue.iter_mut().rev() {
+                    if p.sent {
+                        break;
+                    }
+                    let cur = (p.term, p.index);
+                    if cur > last {
+                        continue;
+                    }
+                    if cur < first {
+                        break;
+                    }
+                    for tracker in p.cb.write_trackers() {
+                        tracker.observe(now, &ctx.raft_metrics.wf_send_proposal, |t| {
+                            &mut t.metrics.wf_send_proposal_nanos
+                        });
+                    }
+                    p.sent = true;
                 }
-                let cur = (p.term, p.index);
-                if cur > last {
-                    continue;
-                }
-                if cur < first {
-                    break;
-                }
-                for tracker in p.cb.write_trackers() {
-                    tracker.observe(now, &ctx.raft_metrics.wf_send_proposal, |t| {
-                        &mut t.metrics.wf_send_proposal_nanos
-                    });
-                }
-                p.sent = true;
             }
         }
         if message.get_msg_type() == MessageType::MsgTimeoutNow {
@@ -709,7 +710,7 @@ impl<EK: KvEngine, ER: RaftEngine> Peer<EK, ER> {
                         let current_time = monotonic_raw_now();
                         ctx.current_time.replace(current_time);
                         ctx.raft_metrics.commit_log.observe(duration_to_sec(
-                            (current_time - propose_time).to_std().unwrap(),
+                            Duration::try_from(current_time - propose_time).unwrap(),
                         ));
                         self.maybe_renew_leader_lease(propose_time, &ctx.store_meta, None);
                         update_lease = false;
@@ -1052,6 +1053,11 @@ impl<EK: KvEngine, ER: RaftEngine> Peer<EK, ER> {
     pub fn on_role_changed<T>(&mut self, ctx: &mut StoreContext<EK, ER, T>, ready: &Ready) {
         // Update leader lease when the Raft state changes.
         if let Some(ss) = ready.ss() {
+            // A pending pre-transfer request belongs to the previous SoftState.
+            // In particular, a follower can learn about a new leader without
+            // changing its role. Do not let it ACK the old request to the new
+            // leader.
+            self.transfer_leader_state_mut().reset_transferee_state();
             let term = self.term();
             match ss.raft_state {
                 StateRole::Leader => {
@@ -1089,9 +1095,6 @@ impl<EK: KvEngine, ER: RaftEngine> Peer<EK, ER> {
                         self.region(),
                         &self.logger,
                     );
-
-                    // Exit entry cache warmup state when the peer becomes leader.
-                    self.transfer_leader_state_mut().cache_warmup_state = None;
 
                     if !ctx.store_disk_usages.is_empty() {
                         self.refill_disk_full_peers(ctx);
@@ -1201,7 +1204,7 @@ impl<EK: KvEngine, ER: RaftEngine> Peer<EK, ER> {
             // When a proposal was proposed with this ctx before, the current_time can be
             // some.
             let current_time = *ctx.current_time.get_or_insert_with(monotonic_raw_now);
-            let elapsed = match (current_time - propose_time).to_std() {
+            let elapsed = match Duration::try_from(current_time - propose_time) {
                 Ok(elapsed) => elapsed,
                 Err(_) => return false,
             };

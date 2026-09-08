@@ -241,6 +241,10 @@
 ## By default, it will be set to 12.5% of the available memory of TiKV.
 # end-point-memory-quota = "0B"
 
+## Maximum number of concurrently running background-limited Analyze tasks.
+## Leave unset (or set to 0) to share the ordinary coprocessor semaphore.
+# end-point-max-bg-concurrency = 0
+
 ## Max bytes that snapshot can interact with disk in one second. It should be
 ## set based on your disk performance. Only write flow is considered, if
 ## partitioned-raft-kv is used, read flow is also considered and it will be estimated
@@ -580,6 +584,11 @@
 ## If the value is `true`, the database will be created if it is missing.
 # create-if-missing = true
 
+## Enables TiKV's defense-in-depth check that successfully created RocksDB snapshots have
+## monotonically non-decreasing sequence numbers. It is enabled by default in debug builds and
+## disabled by default in release builds.
+# enable-snapshot-sequence-number-check = false
+
 ## RocksDB Write-Ahead Logs (WAL) recovery mode.
 ## "tolerate-corrupted-tail-records", tolerate incomplete record in trailing data on all logs;
 ## "absolute-consistency", We don't expect to find any corruption in the WAL;
@@ -620,9 +629,12 @@
 ## When storage.engine is "partitioned-raft-kv", default value is 0.
 # stats-dump-period = "10m"
 
-## Refer to: https://github.com/facebook/rocksdb/wiki/RocksDB-FAQ
-## If you want to use RocksDB on multi disks or spinning disks, you should set value at least 2MB.
-# compaction-readahead-size = 0
+## RocksDB 8.x compaction no longer relies on the old setup-time file hint path,
+## so TiKV keeps compaction readahead enabled by default instead of forcing it
+## to 0. Refer to: https://github.com/facebook/rocksdb/wiki/RocksDB-FAQ
+## If you want to use RocksDB on multi disks or spinning disks, you should set
+## value at least 2MB.
+# compaction-readahead-size = "2MB"
 
 ## Max buffer size that is used by WritableFileWrite.
 # writable-file-max-buffer-size = "1MB"
@@ -1082,6 +1094,11 @@
 # max-manifest-file-size = "20MB"
 # create-if-missing = true
 
+## Enables TiKV's defense-in-depth check that successfully created RocksDB snapshots have
+## monotonically non-decreasing sequence numbers. It is enabled by default in debug builds and
+## disabled by default in release builds.
+# enable-snapshot-sequence-number-check = false
+
 # stats-dump-period = "10m"
 
 ## Raft RocksDB WAL directory.
@@ -1092,7 +1109,9 @@
 ## Do not set this config the same as `rocksdb.wal-dir`.
 # wal-dir = ""
 
-# compaction-readahead-size = 0
+## Keep compaction readahead enabled by default for the same reason as
+## `rocksdb.compaction-readahead-size`.
+# compaction-readahead-size = "2MB"
 # writable-file-max-buffer-size = "1MB"
 # use-direct-io-for-flush-and-compaction = false
 # enable-pipelined-write = true
@@ -1221,6 +1240,7 @@
 # cert-path = ""
 # key-path = ""
 # cert-allowed-cn = []
+# cert-allowed-san = []
 #
 ## Avoid outputing data (e.g. user keys) to info log. It currently does not avoid printing
 ## user data altogether, but greatly reduce those logs.
@@ -1322,6 +1342,9 @@
 ## in order to reduce impact on the cluster's performance during back up.
 # enable-auto-tune = true
 
+## Enable GCP v2 external storage backend for backup/restore.
+# gcp-v2-enable = true
+
 [log-backup]
 ## Number of threads to perform backup stream tasks.
 ## The default value is CPU_NUM * 0.5, and limited to [2, 12].
@@ -1330,6 +1353,10 @@
 ## enable this feature. TiKV will starts watch related tasks in PD. and backup kv changes to storage accodring to task.
 ## The default value is false.
 # enable = true
+
+## Enable GCP v2 external storage backend for log-backup.
+## If not set, default is enabled.
+# gcp-v2-enable = true
 
 [backup.hadoop]
 ## let TiKV know how to find the hdfs shell command.
@@ -1342,7 +1369,10 @@
 
 [pessimistic-txn]
 ## The default and maximum delay before responding to TiDB when pessimistic
-## transactions encounter locks
+## transactions encounter locks.
+## After a lock owner change, a fair waiter is not re-registered in the
+## wait-for graph until this wait ends. Raising this value also raises
+## worst-case deadlock detection delay for those waits.
 # wait-for-lock-timeout = "1s"
 
 ## If more than one transaction is waiting for the same lock, only the one with smallest

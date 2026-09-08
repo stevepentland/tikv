@@ -74,6 +74,7 @@ end-point-stream-batch-row-limit = 4096
 end-point-enable-batch-if-possible = true
 end-point-request-max-handle-duration = "12s"
 end-point-max-concurrency = 10
+end-point-max-bg-concurrency = 3
 end-point-perf-level = 5
 snap-io-max-bytes-per-sec = "10MB"
 snap-max-total-size = "10GB"
@@ -648,6 +649,10 @@ enable-compaction-filter = false
 compaction-filter-skip-version-check = true
 num-threads = 2
 
+[gc.auto-compaction]
+mvcc-read-aware-enabled = true
+mvcc-scan-threshold = 10000
+
 [pessimistic-txn]
 enabled = false                # test backward compatibility
 wait-for-lock-timeout = "10ms"
@@ -675,6 +680,8 @@ advance-ts-interval = "5s"
 scan-lock-pool-size = 1
 memory-quota = "1MB"
 incremental-scan-concurrency = 7
+memory-quota-active-check-interval = "2s"
+memory-quota-exceeded-backoff-duration = "1s"
 
 [split]
 detect-times = 10
@@ -688,3 +695,14 @@ split.split-contained-score = 0.5
 [resource-control]
 enabled = false
 priority-ctl-strategy = "aggressive"
+bg-cpu-throttle-threshold = 60.0
+fg-cpu-throttle-threshold = 70.0
+bg-compaction-pressure-threshold = 70.0
+bg-write-io-ceiling = "100GB"
+bg-write-io-floor = "10MB"
+enable-fair-scheduling = false
+enable-read-admission-control = false
+enable-write-admission-control = false
+historical-usage-window-mins = 15
+baseline-burst-pct = 20.0
+admission-max-delayed-count = 10000

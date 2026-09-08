@@ -41,13 +41,14 @@ use txn_types::{Key, Lock, LockType, TimeStamp, WriteBatchFlags, WriteRef, Write
 
 use crate::{
     Error, Result,
-    channel::{CDC_EVENT_MAX_BYTES, CdcEvent, SendError, Sink},
+    channel::{Barrier, CDC_EVENT_MAX_BYTES, CdcEvent, SendError, Sink},
     endpoint::Advance,
     initializer::KvEntry,
     metrics::*,
     old_value::{OldValueCache, OldValueCallback},
-    service::{Conn, ConnId, FeatureGate, RequestId},
+    service::{Conn, FeatureGate, RequestId},
     txn_source::TxnSource,
+    types::ConnId,
 };
 
 static DOWNSTREAM_ID_ALLOC: AtomicUsize = AtomicUsize::new(0);
@@ -68,9 +69,10 @@ impl Default for DownstreamId {
     }
 }
 
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
 pub enum DownstreamState {
     /// It's just created and rejects change events and resolved timestamps.
+    #[default]
     Uninitialized,
     /// It has got a snapshot for incremental scan, and change events will be
     /// accepted. However, it still rejects resolved timestamps.
@@ -79,12 +81,6 @@ pub enum DownstreamState {
     /// now.
     Normal,
     Stopped,
-}
-
-impl Default for DownstreamState {
-    fn default() -> Self {
-        Self::Uninitialized
-    }
 }
 
 /// Should only be called when it's uninitialized or stopped. Return false if
@@ -152,7 +148,7 @@ impl fmt::Debug for Downstream {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Downstream")
             .field("id", &self.id)
-            .field("req_id", &self.req_id)
+            .field("request_id", &self.req_id)
             .field("conn_id", &self.conn_id)
             .finish()
     }
@@ -192,39 +188,55 @@ impl Downstream {
         }
     }
 
-    // NOTE: it's not allowed to sink `EventError` directly by this function,
-    // because the sink can be also used by an incremental scan. We must ensure
-    // no more events can be pushed to the sink after an `EventError` is sent.
-    pub fn sink_event(&self, mut event: Event, force: bool) -> Result<()> {
-        event.set_request_id(self.req_id.0);
-        if self.sink.is_none() {
-            info!("cdc drop event, no sink";
-                "conn_id" => ?self.conn_id, "downstream_id" => ?self.id, "req_id" => ?self.req_id);
-            return Err(Error::Sink(SendError::Disconnected));
-        }
-        let sink = self.sink.as_ref().unwrap();
-        match sink.unbounded_send(CdcEvent::Event(event), force) {
+    fn sink_cdc_event(&self, event: CdcEvent, force: bool) -> Result<()> {
+        let sink = match self.sink.as_ref() {
+            Some(sink) => sink,
+            None => {
+                info!("cdc drop event, no sink";
+                    "downstream_id" => ?self.id,
+                    "request_id" => ?self.req_id,
+                    "conn_id" => ?self.conn_id);
+                return Err(Error::Sink(SendError::Disconnected));
+            }
+        };
+        match sink.unbounded_send(event, force) {
             Ok(_) => Ok(()),
             Err(SendError::Disconnected) => {
                 debug!("cdc send event failed, disconnected";
-                    "conn_id" => ?self.conn_id, "downstream_id" => ?self.id, "req_id" => ?self.req_id);
+                    "downstream_id" => ?self.id,
+                    "request_id" => ?self.req_id,
+                    "conn_id" => ?self.conn_id);
                 Err(Error::Sink(SendError::Disconnected))
             }
             // TODO handle errors.
             Err(e @ SendError::Full) | Err(e @ SendError::Congested) => {
                 info!("cdc send event failed, full";
-                    "conn_id" => ?self.conn_id, "downstream_id" => ?self.id, "req_id" => ?self.req_id);
+                    "downstream_id" => ?self.id,
+                    "request_id" => ?self.req_id,
+                    "conn_id" => ?self.conn_id);
                 Err(Error::Sink(e))
             }
         }
+    }
+
+    // NOTE: it's not allowed to sink `EventError` directly by this function,
+    // because the sink can be also used by an incremental scan. We must ensure
+    // no more events can be pushed to the sink after an `EventError` is sent.
+    pub fn sink_event(&self, mut event: Event, force: bool) -> Result<()> {
+        event.set_request_id(self.req_id.0);
+        let event = CdcEvent::Event(event);
+        self.sink_cdc_event(event, force)
     }
 
     /// EventErrors must be sent by this function. And we must ensure no more
     /// events or ResolvedTs will be sent to the downstream after
     /// `sink_error_event` is called.
     pub fn sink_error_event(&self, region_id: u64, err_event: EventError) -> Result<()> {
-        info!("cdc downstream meets region error";
-            "conn_id" => ?self.conn_id, "downstream_id" => ?self.id, "req_id" => ?self.req_id);
+        info!("cdc downstream send region error";
+            "downstream_id" => ?self.id,
+            "request_id" => ?self.req_id,
+            "region_id" => region_id,
+            "conn_id" => ?self.conn_id);
 
         self.scan_truncated.store(true, Ordering::Release);
         let mut change_data_event = Event::default();
@@ -233,6 +245,10 @@ impl Downstream {
         // Try it's best to send error events.
         let force_send = true;
         self.sink_event(change_data_event, force_send)
+    }
+
+    pub fn sink_barrier(&self, barrier: Barrier) -> Result<()> {
+        self.sink_cdc_event(CdcEvent::Barrier(barrier), true)
     }
 
     pub fn set_sink(&mut self, sink: Sink) {
@@ -474,8 +490,8 @@ impl Delegate {
             Error::MemoryQuotaExceeded(tikv_util::memory::MemoryQuotaExceeded)
         ));
 
-        info!("cdc region is ready"; "region_id" => self.region_id);
         self.finish_prepare_lock_tracker(region, locks)?;
+        info!("cdc region is ready"; "region_id" => self.region_id);
 
         let region = match &self.lock_tracker {
             LockTracker::Prepared { region, .. } => region,
@@ -573,10 +589,13 @@ impl Delegate {
     /// It broadcasts errors to all downstream and stops.
     pub fn stop(&mut self, err: Error) {
         self.mark_failed();
+        info!("cdc region met error";
+            "error" => ?err,
+            "downstream_count" => self.downstreams.len(),
+            "observe_id" => ?self.handle.id,
+            "region_id" => self.region_id);
         self.stop_observing();
 
-        info!("cdc met region error";
-            "region_id" => self.region_id, "error" => ?err);
         let region_id = self.region_id;
         let error = err.into_error_event(self.region_id);
         let send = move |downstream: &Downstream| {
@@ -585,11 +604,6 @@ impl Delegate {
             if let Err(err) = downstream.sink_error_event(region_id, error_event) {
                 warn!("cdc send region error failed";
                     "region_id" => region_id, "error" => ?err, "origin_error" => ?error,
-                    "downstream_id" => ?downstream.id, "downstream" => ?downstream.peer,
-                    "request_id" => ?downstream.req_id, "conn_id" => ?downstream.conn_id);
-            } else {
-                info!("cdc send region error success";
-                    "region_id" => region_id, "origin_error" => ?error,
                     "downstream_id" => ?downstream.id, "downstream" => ?downstream.peer,
                     "request_id" => ?downstream.req_id, "conn_id" => ?downstream.conn_id);
             }
@@ -773,7 +787,16 @@ impl Delegate {
                     if !observed_range.contains_encoded_key(&lock.0) {
                         continue;
                     }
-                    let l = Lock::parse(&lock.1).unwrap();
+                    let lock_type = txn_types::decode_lock_type(&lock.1).unwrap();
+                    if !matches!(lock_type, LockType::Put | LockType::Delete) {
+                        // We only send locks with data changes to downstream.
+                        debug!("cdc skip lock record"; "lock" => ?lock_type, "key" => %Key::from_encoded(lock.0));
+                        continue;
+                    }
+                    let l = txn_types::parse_lock(&lock.1)
+                        .unwrap()
+                        .left()
+                        .expect("only put/delete lock should be here");
                     if decode_lock(lock.0, l, &mut row, &mut _has_value) {
                         continue;
                     }
@@ -953,6 +976,7 @@ impl Delegate {
                 }
                 // lock_heap initialized and there is lock_modified_counts, update the lock_heap
                 // to avoid the resolved-ts stuck.
+                #[allow(clippy::unnecessary_unwrap)]
                 if !lock_modified_counts.is_empty() && downstream.lock_heap.is_some() {
                     let lock_heap = downstream.lock_heap.as_mut().unwrap();
                     lock_modified_counts.iter().for_each(|modified| {
@@ -1039,14 +1063,23 @@ impl Delegate {
                 }
             }
             "lock" => {
-                let lock = Lock::parse(put.get_value()).unwrap();
+                let lock_type = txn_types::decode_lock_type(put.get_value()).unwrap();
+                if !matches!(lock_type, LockType::Put | LockType::Delete) {
+                    // We only send locks with data changes to downstream.
+                    debug!("cdc skip lock record"; "lock" => ?lock_type, "key" => %Key::from_encoded(put.take_key()));
+                    return Ok(());
+                }
+                let lock = txn_types::parse_lock(put.get_value())
+                    .unwrap()
+                    .left()
+                    .expect("only put/delete lock should be here");
                 let for_update_ts = lock.for_update_ts;
                 let txn_source = lock.txn_source;
 
                 let key = Key::from_encoded_slice(&put.key);
                 let row = rows.txns_by_key.entry(key.clone()).or_default();
                 if decode_lock(put.take_key(), lock, &mut row.v, &mut row.has_value) {
-                    return Ok(());
+                    unreachable!("non put/delete lock has been filtered");
                 }
 
                 let mini_lock = MiniLock::new(row.v.start_ts, txn_source);
@@ -1116,11 +1149,11 @@ impl Delegate {
         ) {
             info!(
                 "cdc fail to subscribe downstream";
-                "region_id" => region.id,
+                "error" => ?e,
                 "downstream_id" => ?downstream.id,
+                "request_id" => ?downstream.req_id,
+                "region_id" => region.id,
                 "conn_id" => ?downstream.conn_id,
-                "req_id" => ?downstream.req_id,
-                "err" => ?e
             );
             // Downstream is outdated, mark stop.
             downstream.state.store(DownstreamState::Stopped);
@@ -1130,7 +1163,10 @@ impl Delegate {
     }
 
     fn stop_observing(&self) {
-        info!("cdc stop observing"; "region_id" => self.region_id, "failed" => self.failed);
+        info!("cdc stop observing";
+            "failed" => self.failed,
+            "observe_id" => ?self.handle.id,
+            "region_id" => self.region_id);
         // Stop observe further events.
         self.handle.stop_observing();
         // To inform transaction layer no more old values are required for the region.
@@ -1254,6 +1290,7 @@ fn decode_write(
     false
 }
 
+// decode the lock and return true that the caller should skip the record
 fn decode_lock(key: Vec<u8>, mut lock: Lock, row: &mut EventRow, has_value: &mut bool) -> bool {
     let key = Key::from_encoded(key);
     let op_type = match lock.lock_type {
@@ -1632,7 +1669,7 @@ mod tests {
 
     #[test]
     fn test_observed_range() {
-        for case in vec![
+        for case in [
             (b"".as_slice(), b"".as_slice(), false),
             (b"a", b"", false),
             (b"", b"b", false),

@@ -5,11 +5,16 @@ mod keys;
 mod size;
 mod table;
 
-use kvproto::{metapb::Region, pdpb::CheckPolicy};
+use kvproto::{
+    metapb::Region,
+    pdpb::{CheckPolicy, SplitReason},
+};
 use tikv_util::box_try;
 
 pub use self::{
-    half::{HalfCheckObserver, get_region_approximate_middle},
+    half::{
+        HalfCheckObserver, get_region_approximate_middle, get_region_approximate_middle_in_range,
+    },
     keys::{KeysCheckObserver, get_region_approximate_keys},
     size::{SizeCheckObserver, get_region_approximate_size},
     table::TableCheckObserver,
@@ -18,22 +23,22 @@ use super::{Bucket, KeyEntry, ObserverContext, SplitChecker, config::Config, err
 
 pub struct Host<'a, E> {
     checkers: Vec<Box<dyn SplitChecker<E>>>,
-    auto_split: bool,
+    split_reason: SplitReason,
     cfg: &'a Config,
 }
 
 impl<'a, E> Host<'a, E> {
-    pub fn new(auto_split: bool, cfg: &'a Config) -> Host<'a, E> {
+    pub fn new(split_reason: SplitReason, cfg: &'a Config) -> Host<'a, E> {
         Host {
-            auto_split,
+            split_reason,
             checkers: vec![],
             cfg,
         }
     }
 
     #[inline]
-    pub fn auto_split(&self) -> bool {
-        self.auto_split
+    pub fn split_reason(&self) -> SplitReason {
+        self.split_reason
     }
 
     #[inline]
@@ -126,6 +131,11 @@ impl<'a, E> Host<'a, E> {
     #[inline]
     pub fn region_bucket_size(&self) -> u64 {
         self.cfg.region_bucket_size.0
+    }
+
+    #[cfg(test)]
+    pub fn checkers_count(&self) -> usize {
+        self.checkers.len()
     }
 }
 

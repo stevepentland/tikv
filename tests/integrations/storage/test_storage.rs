@@ -1093,6 +1093,9 @@ fn test_txn_store_rawkv_api_version() {
                             store.raw_scan_err(cf.to_owned(), key.to_vec(), None, 100);
                             store.raw_batch_scan_err(cf.to_owned(), vec![range.clone()], 100);
                         }
+                        ApiVersion::V3 => {
+                            unreachable!("API V3 is not supported by this TiKV build")
+                        }
                     }
                 }
 
@@ -1102,6 +1105,13 @@ fn test_txn_store_rawkv_api_version() {
                     Some(b"value".to_vec()),
                     b"new_value".to_vec(),
                     (Some(b"value".to_vec()), true),
+                );
+
+                store.raw_compare_and_swap_atomic_delete_ok(
+                    cf.to_owned(),
+                    key.to_vec(),
+                    Some(b"new_value".to_vec()),
+                    (Some(b"new_value".to_vec()), true),
                 );
 
                 store.raw_batch_delete_atomic_ok(cf.to_owned(), vec![key.to_vec()]);

@@ -10,7 +10,7 @@ use kvproto::kvrpcpb::ApiVersion;
 use libc::c_int;
 use online_config::OnlineConfig;
 use tikv_util::{
-    config::{self, ReadableDuration, ReadableSize},
+    config::{self, ReadableDuration, ReadableSize, ReadableSizeOrPercent},
     sys::SysQuota,
 };
 
@@ -62,7 +62,7 @@ const DEFAULT_TXN_STATUS_CACHE_CAPACITY: usize = 40_000 * 128;
 
 // Block cache capacity used when TikvConfig isn't validated. It should only
 // occur in tests.
-const FALLBACK_BLOCK_CACHE_CAPACITY: ReadableSize = ReadableSize::mb(128);
+const FALLBACK_BLOCK_CACHE_CAPACITY: ReadableSizeOrPercent = ReadableSizeOrPercent::mb(128);
 
 const DEFAULT_ACTION_ON_INVALID_MAX_TS_UPDATE: &str = "panic";
 
@@ -255,6 +255,9 @@ impl Config {
                 self.api_version = 2;
                 self.enable_ttl = true;
             }
+            ApiVersion::V3 => {
+                unreachable!("API V3 is not supported by this TiKV build")
+            }
         }
     }
 }
@@ -308,7 +311,7 @@ impl FlowControlConfig {
 pub struct BlockCacheConfig {
     #[online_config(skip)]
     pub shared: Option<bool>,
-    pub capacity: Option<ReadableSize>,
+    pub capacity: Option<ReadableSizeOrPercent>,
     #[online_config(skip)]
     pub num_shard_bits: i32,
     #[online_config(skip)]
@@ -512,10 +515,13 @@ impl Default for MaxTsConfig {
 
 impl MaxTsConfig {
     fn validate(&mut self) -> Result<(), Box<dyn Error>> {
-        if self.max_drift <= self.cache_sync_interval {
+        // Max-ts enforcement uses millisecond precision, so compare the effective
+        // values at the same precision.
+        if self.max_drift.as_millis() <= self.cache_sync_interval.as_millis() {
             let msg = format!(
-                "storage.max-ts.max-drift {:?} is smaller than or equal to storage.max-ts.cache-sync-interval {:?}",
-                self.max_drift, self.cache_sync_interval,
+                "storage.max-ts.max-drift effective value {}ms is smaller than or equal to storage.max-ts.cache-sync-interval effective value {}ms",
+                self.max_drift.as_millis(),
+                self.cache_sync_interval.as_millis(),
             );
             error!("{}", msg);
             return Err(msg.into());
@@ -556,6 +562,24 @@ mod tests {
 
         cfg.scheduler_worker_pool_size = max_pool_size + 1;
         cfg.validate().unwrap_err();
+    }
+
+    #[test]
+    fn test_validate_max_ts_config_uses_effective_milliseconds() {
+        let mut cfg = MaxTsConfig {
+            max_drift: ReadableDuration::micros(1_501),
+            cache_sync_interval: ReadableDuration::micros(1_001),
+            ..Default::default()
+        };
+
+        let err = cfg.validate().unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "storage.max-ts.max-drift effective value 1ms is smaller than or equal to storage.max-ts.cache-sync-interval effective value 1ms",
+        );
+
+        cfg.max_drift = ReadableDuration::micros(2_000);
+        cfg.validate().unwrap();
     }
 
     #[test]

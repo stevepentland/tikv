@@ -840,10 +840,18 @@ impl PdCluster {
         }
         self.leaders.insert(region.get_id(), leader.clone());
 
-        self.region_approximate_size
-            .insert(region.get_id(), region_stat.approximate_size);
-        self.region_approximate_keys
-            .insert(region.get_id(), region_stat.approximate_keys);
+        // only update region approximate size/keys when the stats data > 0.
+        // 0 value means the stats data is uninitialized.
+        // The equvalent logic in pd is: https://github.com/tikv/pd/blob/23550ebb90464948a2d6539d9dc9d6d067924d79/pkg/core/region.go#L275
+        if region_stat.approximate_size > 0 {
+            self.region_approximate_size
+                .insert(region.get_id(), region_stat.approximate_size);
+        }
+        if region_stat.approximate_keys > 0 {
+            self.region_approximate_keys
+                .insert(region.get_id(), region_stat.approximate_keys);
+        }
+
         self.region_last_report_ts
             .insert(region.get_id(), region_stat.last_report_ts);
         self.region_last_report_term.insert(region.get_id(), term);
@@ -1805,6 +1813,7 @@ impl PdClient for TestPdClient {
         &self,
         region: metapb::Region,
         count: usize,
+        _reason: pdpb::SplitReason,
     ) -> PdFuture<pdpb::AskBatchSplitResponse> {
         if self.is_incompatible {
             return Box::pin(err(Error::Incompatible));
@@ -1980,12 +1989,22 @@ impl PdClient for TestPdClient {
         safepoint: TimeStamp,
         ttl: Duration,
     ) -> PdFuture<()> {
+        let mut gc_safepoints = self.gc_safepoints.wl();
+        if ttl.is_zero() {
+            gc_safepoints.retain(|sp| sp.service != name);
+            return Box::pin(ok(()));
+        }
         if ttl.as_secs() > 0 {
-            self.gc_safepoints.wl().push(ServiceSafePoint {
-                service: name,
-                ttl,
-                safepoint,
-            });
+            if let Some(sp) = gc_safepoints.iter_mut().find(|sp| sp.service == name) {
+                sp.ttl = ttl;
+                sp.safepoint = safepoint;
+            } else {
+                gc_safepoints.push(ServiceSafePoint {
+                    service: name,
+                    ttl,
+                    safepoint,
+                });
+            }
         }
         Box::pin(ok(()))
     }

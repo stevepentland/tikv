@@ -14,6 +14,7 @@ use std::{
 use collections::HashMap;
 use kvproto::resource_usage_agent::ResourceUsageRecord;
 use tikv_util::{
+    thread_name_prefix::RESOURCE_METERING_RECORDER_THREAD,
     time::Duration,
     warn,
     worker::{Builder as WorkerBuilder, LazyWorker, Runnable, RunnableWithTimer, Scheduler},
@@ -98,12 +99,27 @@ impl Reporter {
         let ts = records.begin_unix_time_secs;
         let n = self.config.max_resource_groups;
         if self.config.enable_network_io_collection {
+            let enable_detailed_io_collection = self.config.detailed_io_collection_enabled();
             let (agg_tag_map, agg_region_map) = records.aggregate_by_extra_tag_and_region();
-            handle_records_impl(&mut self.records, true, &agg_tag_map, ts, n);
-            handle_records_impl(&mut self.region_records, true, &agg_region_map, ts, n);
+            handle_records_impl(
+                &mut self.records,
+                true,
+                enable_detailed_io_collection,
+                &agg_tag_map,
+                ts,
+                n,
+            );
+            handle_records_impl(
+                &mut self.region_records,
+                true,
+                enable_detailed_io_collection,
+                &agg_region_map,
+                ts,
+                n,
+            );
         } else {
             let agg_map = records.aggregate_by_extra_tag();
-            handle_records_impl(&mut self.records, false, &agg_map, ts, n);
+            handle_records_impl(&mut self.records, false, false, &agg_map, ts, n);
         }
     }
 
@@ -238,10 +254,10 @@ pub fn init_reporter(
     DataSinkRegHandle,
     Box<LazyWorker<Task>>,
 ) {
-    let mut reporter_worker = WorkerBuilder::new("resource-metering-reporter")
+    let mut reporter_worker = WorkerBuilder::new(RESOURCE_METERING_RECORDER_THREAD)
         .pending_capacity(30)
         .create()
-        .lazy_build("resource-metering-reporter");
+        .lazy_build(RESOURCE_METERING_RECORDER_THREAD);
     let reporter_scheduler = reporter_worker.scheduler();
     let data_sink_reg_handle = DataSinkRegHandle::new(reporter_scheduler.clone());
     let reporter = Reporter::new(config, collector_reg_handle, reporter_scheduler.clone());
@@ -300,6 +316,7 @@ mod tests {
             max_resource_groups: 3000,
             precision: ReadableDuration::secs(2),
             enable_network_io_collection: false,
+            enable_detailed_io_collection: false,
         }));
         assert_eq!(r.get_interval(), Duration::from_secs(120));
         let mut records = HashMap::default();
@@ -319,6 +336,7 @@ mod tests {
                 network_out_bytes: 5,
                 logical_read_bytes: 6,
                 logical_write_bytes: 7,
+                ..Default::default()
             },
         );
         r.run(Task::Records(Arc::new(RawRecords {
@@ -369,6 +387,7 @@ mod tests {
                 network_out_bytes: 5,
                 logical_read_bytes: 6,
                 logical_write_bytes: 7,
+                ..Default::default()
             },
         );
 
@@ -418,6 +437,7 @@ mod tests {
             max_resource_groups: 3000,
             precision: ReadableDuration::secs(2),
             enable_network_io_collection: true,
+            enable_detailed_io_collection: false,
         }));
         assert_eq!(r.get_interval(), Duration::from_secs(120));
         let mut records = HashMap::default();
@@ -437,6 +457,7 @@ mod tests {
                 network_out_bytes: 5,
                 logical_read_bytes: 6,
                 logical_write_bytes: 7,
+                ..Default::default()
             },
         );
         r.run(Task::Records(Arc::new(RawRecords {

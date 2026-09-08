@@ -20,6 +20,10 @@ use super::{
 #[serde(default)]
 #[serde(rename_all = "kebab-case")]
 pub struct Config {
+    /// Default and maximum pessimistic lock wait. After a lock owner change, a
+    /// fair waiter is not re-registered in the wait-for graph until this
+    /// wait ends, so raising this also raises worst-case deadlock detection
+    /// delay for those waits.
     #[serde(deserialize_with = "readable_duration_or_u64")]
     pub wait_for_lock_timeout: ReadableDuration,
     #[serde(deserialize_with = "readable_duration_or_u64")]
@@ -173,8 +177,8 @@ mod tests {
         let config: Config = toml::from_str(conf).unwrap();
         assert_eq!(config.wait_for_lock_timeout.as_millis(), 10);
         assert_eq!(config.wake_up_delay_duration.as_millis(), 100);
-        assert_eq!(config.pipelined, false);
-        assert_eq!(config.in_memory, false);
+        assert!(!config.pipelined);
+        assert!(!config.in_memory);
         assert_eq!(config.in_memory_peer_size_limit.0, 512 << 10);
         assert_eq!(config.in_memory_instance_size_limit.0, 100 << 20);
     }

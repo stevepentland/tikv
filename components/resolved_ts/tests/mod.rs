@@ -34,7 +34,6 @@ impl TestSuite {
         // Start resolved ts endpoint.
         cluster.cfg.resolved_ts.enable = true;
         cluster.cfg.resolved_ts.advance_ts_interval = ReadableDuration::millis(10);
-        cluster.run();
 
         TestSuite {
             cluster,
@@ -42,6 +41,10 @@ impl TestSuite {
             tikv_cli: HashMap::default(),
             import_cli: HashMap::default(),
         }
+    }
+
+    pub fn run(&mut self) {
+        self.cluster.run();
     }
 
     pub fn stop(mut self) {
@@ -53,7 +56,7 @@ impl TestSuite {
             let mut c = std::collections::HashMap::default();
             c.insert(
                 "advance_ts_interval".to_owned(),
-                ConfigValue::Duration(new_interval.as_millis() as u64),
+                ConfigValue::Duration(new_interval),
             );
             c
         };
